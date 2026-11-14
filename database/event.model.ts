@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import mongoose, { Schema, type Model } from "mongoose";
 
 export interface EventFields {
@@ -67,6 +68,11 @@ const eventSchema = new Schema<EventFields>(
 
 eventSchema.index({ slug: 1 }, { unique: true });
 
+const generatedSlugs = new WeakMap<object, string>();
+const callerSuppliedSlugs = new WeakSet<object>();
+const pendingSlugRetries = new WeakMap<object, string>();
+const maxSlugRetries = 3;
+
 function createSlug(title: string): string {
   return title
     .normalize("NFKD")
@@ -77,26 +83,63 @@ function createSlug(title: string): string {
     .replace(/^-+|-+$/g, "");
 }
 
+function createGeneratedSlug(title: string): string {
+  const baseSlug = createSlug(title);
+  if (!baseSlug) {
+    throw new Error("Event title must produce a non-empty slug");
+  }
+
+  return `${baseSlug}-${randomBytes(8).toString("hex")}`;
+}
+
+function hasSlugKey(value: unknown): boolean {
+  return typeof value === "object" && value !== null && "slug" in value;
+}
+
+function isDuplicateSlugError(error: unknown): boolean {
+  if (
+    typeof error !== "object" ||
+    error === null ||
+    !("code" in error) ||
+    error.code !== 11000
+  ) {
+    return false;
+  }
+
+  if ("keyPattern" in error && hasSlugKey(error.keyPattern)) return true;
+  if ("keyValue" in error && hasSlugKey(error.keyValue)) return true;
+  return "message" in error && typeof error.message === "string" && /slug_1/.test(error.message);
+}
+
 function normalizeDate(value: string): string {
-  const trimmedValue = value.trim();
-  const isoDate = trimmedValue.match(/^(\d{4}-\d{2}-\d{2})(?:T.*)?$/);
-  if (isoDate) {
-    const datePart = isoDate[1];
-    const dateOnly = new Date(`${datePart}T00:00:00.000Z`);
-    if (
-      !Number.isFinite(dateOnly.getTime()) ||
-      dateOnly.toISOString().slice(0, 10) !== datePart
-    ) {
-      throw new Error("Event date must be a valid date");
-    }
+  const date = value.trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    throw new Error("Event date must use YYYY-MM-DD format; timestamps are not supported");
   }
 
-  const parsed = new Date(trimmedValue);
-  if (!Number.isFinite(parsed.getTime())) {
-    throw new Error("Event date must be a valid date");
+  const [year, month, day] = date.split("-").map(Number);
+  const isLeapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const daysInMonth = [
+    31,
+    isLeapYear ? 29 : 28,
+    31,
+    30,
+    31,
+    30,
+    31,
+    31,
+    30,
+    31,
+    30,
+    31,
+  ][month - 1];
+
+  if (!daysInMonth || day < 1 || day > daysInMonth) {
+    throw new Error("Event date must be a valid calendar date");
   }
 
-  return parsed.toISOString().slice(0, 10);
+  // Keep the calendar date unchanged; the event's time is stored separately.
+  return date;
 }
 
 function normalizeTime(value: string): string {
@@ -120,14 +163,29 @@ function normalizeTime(value: string): string {
 }
 
 eventSchema.pre("save", function () {
-  // Regenerate the URL slug only when the title is new or has changed.
-  if (this.isNew || this.isModified("title")) {
-    const slug = createSlug(this.title);
-    if (!slug) {
-      throw new Error("Event title must produce a non-empty slug");
-    }
-    this.slug = slug;
-  } else if (!this.slug?.trim()) {
+  const currentSlug = this.slug?.trim();
+  const previouslyGeneratedSlug = generatedSlugs.get(this);
+  if (
+    this.isModified("slug") &&
+    currentSlug &&
+    currentSlug !== previouslyGeneratedSlug
+  ) {
+    callerSuppliedSlugs.add(this);
+  }
+
+  const retrySlug = pendingSlugRetries.get(this);
+  if (retrySlug) {
+    this.slug = retrySlug;
+    pendingSlugRetries.delete(this);
+  } else if (
+    (this.isNew || this.isModified("title")) &&
+    !callerSuppliedSlugs.has(this)
+  ) {
+    this.slug = createGeneratedSlug(this.title);
+    generatedSlugs.set(this, this.slug);
+  }
+
+  if (!this.slug?.trim()) {
     throw new Error("Event slug must not be empty");
   }
 
@@ -139,3 +197,33 @@ eventSchema.pre("save", function () {
 export const Event: Model<EventFields> =
   (mongoose.models.Event as Model<EventFields> | undefined) ??
   mongoose.model<EventFields>("Event", eventSchema);
+
+type EventDocument = ReturnType<typeof Event.hydrate>;
+const originalSave = Event.prototype.save;
+// Save middleware runs before MongoDB writes, so retry duplicate-key failures here.
+Event.prototype.save = async function (
+  this: EventDocument,
+  ...args: Parameters<EventDocument["save"]>
+) {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await originalSave.apply(this, args);
+    } catch (error) {
+      const generatedSlug = generatedSlugs.get(this);
+      if (
+        !isDuplicateSlugError(error) ||
+        !generatedSlug ||
+        callerSuppliedSlugs.has(this) ||
+        attempt >= maxSlugRetries
+      ) {
+        pendingSlugRetries.delete(this);
+        throw error;
+      }
+
+      const nextSlug = createGeneratedSlug(this.title);
+      this.slug = nextSlug;
+      generatedSlugs.set(this, nextSlug);
+      pendingSlugRetries.set(this, nextSlug);
+    }
+  }
+} as typeof Event.prototype.save;
