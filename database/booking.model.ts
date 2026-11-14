@@ -3,6 +3,7 @@ import { Event } from "./event.model";
 
 export interface BookingFields {
   eventId: Types.ObjectId;
+  slug: string;
   email: string;
   createdAt?: Date;
   updatedAt?: Date;
@@ -16,6 +17,11 @@ const bookingSchema = new Schema<BookingFields>(
       type: Schema.Types.ObjectId,
       ref: "Event",
       required: true,
+    },
+    slug: {
+      type: String,
+      required: true,
+      trim: true,
     },
     email: {
       type: String,
@@ -34,10 +40,10 @@ const bookingSchema = new Schema<BookingFields>(
 bookingSchema.index({ eventId: 1 });
 
 bookingSchema.pre("save", async function () {
-  // Ensure the booking references an event that exists before saving.
-  const eventExists = await Event.exists({ _id: this.eventId });
+  // Ensure the event ID and slug identify the same existing event.
+  const eventExists = await Event.exists({ _id: this.eventId, slug: this.slug });
   if (!eventExists) {
-    throw new Error("Cannot create a booking for an event that does not exist");
+    throw new Error("Cannot create a booking for an event that does not match the given ID and slug");
   }
 });
 
